@@ -1279,7 +1279,10 @@ func (s *InboundService) UpdateInboundClient(data *model.Inbound, clientId strin
 		}
 	}
 	needRestart := false
-	if len(oldEmail) > 0 {
+	if len(oldEmail) == 0 {
+		logger.Debug("Client old email not found")
+		needRestart = true
+	} else if xrayUserChanged(oldClients[clientIndex], clients[0]) {
 		xrayApi := new(xray.XrayAPI)
 		xrayApi.Init(p.GetAPIPort())
 		if oldClients[clientIndex].Enable {
@@ -1317,11 +1320,28 @@ func (s *InboundService) UpdateInboundClient(data *model.Inbound, clientId strin
 			}
 		}
 		xrayApi.Close()
-	} else {
-		logger.Debug("Client old email not found")
-		needRestart = true
 	}
 	return needRestart, tx.Save(oldInbound).Error
+}
+
+// xrayUserChanged reports whether an edit changes what Xray holds for the user; limits and expiry live only in the panel.
+// Re-adding an unchanged user is not free: Xray built from ariansharifi/Xray-core closes a removed user's connections.
+func xrayUserChanged(old, updated model.Client) bool {
+	oldReverse, updatedReverse := "", ""
+	if old.Reverse != nil {
+		oldReverse = old.Reverse.Tag
+	}
+	if updated.Reverse != nil {
+		updatedReverse = updated.Reverse.Tag
+	}
+	return old.Enable != updated.Enable ||
+		old.Email != updated.Email ||
+		old.ID != updated.ID ||
+		old.Password != updated.Password ||
+		old.Auth != updated.Auth ||
+		old.Flow != updated.Flow ||
+		old.Security != updated.Security ||
+		oldReverse != updatedReverse
 }
 
 func (s *InboundService) AddTraffic(inboundTraffics []*xray.Traffic, clientTraffics []*xray.ClientTraffic) (bool, bool, error) {

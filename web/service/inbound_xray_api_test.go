@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/mhsanaei/3x-ui/v2/database"
@@ -113,6 +115,72 @@ func seedVlessInbound(t *testing.T, s *InboundService, port int, clients ...mode
 		t.Fatalf("seed inbound %d: %v", port, err)
 	}
 	return inbound
+}
+
+// A patched Xray closes a removed user's connections, so a remove+re-add on every edit would disconnect the customer.
+func TestUpdateInboundClientTouchesXrayOnlyWhenXrayFieldsChange(t *testing.T) {
+	const tag = "inbound-40001"
+	cases := []struct {
+		name        string
+		seedEnabled bool
+		edit        func(c *model.Client)
+		want        []xrayAPICall
+	}{
+		{
+			name:        "traffic limit, expiry and comment",
+			seedEnabled: true,
+			edit: func(c *model.Client) {
+				c.TotalGB = 50 << 30
+				c.ExpiryTime = time.Now().Add(30 * 24 * time.Hour).UnixMilli()
+				c.Comment = "renewed"
+			},
+		},
+		{
+			name:        "flow",
+			seedEnabled: true,
+			edit:        func(c *model.Client) { c.Flow = "xtls-rprx-vision" },
+			want:        []xrayAPICall{{"remove", tag, "alice"}, {"add", tag, "alice"}},
+		},
+		{
+			name:        "email",
+			seedEnabled: true,
+			edit:        func(c *model.Client) { c.Email = "alice-2" },
+			want:        []xrayAPICall{{"remove", tag, "alice"}, {"add", tag, "alice-2"}},
+		},
+		{
+			name:        "disable",
+			seedEnabled: true,
+			edit:        func(c *model.Client) { c.Enable = false },
+			want:        []xrayAPICall{{"remove", tag, "alice"}},
+		},
+		{
+			name: "enable",
+			edit: func(c *model.Client) { c.Enable = true },
+			want: []xrayAPICall{{"add", tag, "alice"}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := setupXrayAPITest(t)
+			s := &InboundService{}
+			alice := model.Client{ID: uuid.NewString(), Email: "alice", Enable: tc.seedEnabled}
+			inbound := seedVlessInbound(t, s, 40001, alice)
+			fake.takeCalls()
+
+			edited := alice
+			tc.edit(&edited)
+			needRestart, err := s.UpdateInboundClient(&model.Inbound{Id: inbound.Id, Settings: clientSettings(t, edited)}, alice.ID)
+			if err != nil {
+				t.Fatalf("UpdateInboundClient: %v", err)
+			}
+			if needRestart {
+				t.Error("UpdateInboundClient fell back to an Xray restart")
+			}
+			if got := fake.takeCalls(); !slices.Equal(got, tc.want) {
+				t.Errorf("Xray API calls = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 // The panel shares one InboundService across requests; with a shared gRPC client one request's Close broke another's call.
