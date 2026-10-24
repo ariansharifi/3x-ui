@@ -517,9 +517,13 @@ func (s *ServerService) sampleCPUUtilization() (float64, error) {
 	return s.emaCPU, nil
 }
 
+// xrayReleaseRepo serves the panel's Xray builds: upstream plus the VLESS fix that closes a removed user's connections.
+// Switching to an upstream XTLS build would bring back "a disabled user keeps relaying until idle timeout".
+const xrayReleaseRepo = "ariansharifi/Xray-core"
+
 func (s *ServerService) GetXrayVersions() ([]string, error) {
 	const (
-		XrayURL    = "https://api.github.com/repos/XTLS/Xray-core/releases"
+		XrayURL    = "https://api.github.com/repos/" + xrayReleaseRepo + "/releases"
 		bufferSize = 8192
 	)
 
@@ -621,7 +625,7 @@ func (s *ServerService) downloadXRay(version string) (string, error) {
 	}
 
 	fileName := fmt.Sprintf("Xray-%s-%s.zip", osName, arch)
-	url := fmt.Sprintf("https://github.com/XTLS/Xray-core/releases/download/%s/%s", version, fileName)
+	url := fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", xrayReleaseRepo, version, fileName)
 	resp, err := http.Get(url)
 	if err != nil {
 		return "", err
