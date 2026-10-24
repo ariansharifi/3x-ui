@@ -136,12 +136,14 @@ type process struct {
 
 // newProcess creates a new internal process struct for Xray.
 func newProcess(config *Config) *process {
-	return &process{
+	p := &process{
 		version:   "Unknown",
 		config:    config,
 		logWriter: NewLogWriter(),
 		startTime: time.Now(),
 	}
+	p.refreshAPIPort()
+	return p
 }
 
 // newTestProcess creates a process that writes and runs with a specific config path.
@@ -287,7 +289,6 @@ func (p *process) Start() (err error) {
 	}()
 
 	p.refreshVersion()
-	p.refreshAPIPort()
 
 	return nil
 }
