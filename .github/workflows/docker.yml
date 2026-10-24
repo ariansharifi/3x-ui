@@ -4,11 +4,9 @@ permissions:
   contents: read
   packages: write
 
+# Manual only: this fork publishes no Docker images, and the tag trigger failed on missing Docker Hub credentials
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - "v*.*.*"
 
 jobs:
   build:
