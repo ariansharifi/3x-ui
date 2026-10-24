@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/mhsanaei/3x-ui/v2/logger"
@@ -82,6 +83,25 @@ func (s *XrayService) GetXrayVersion() string {
 		return "Unknown"
 	}
 	return p.GetVersion()
+}
+
+// GetInstalledXrayRelease reports the release, and the repo it belongs to, that the installed binary was built from.
+func (s *XrayService) GetInstalledXrayRelease() XrayRelease {
+	if p == nil {
+		return XrayRelease{}
+	}
+	return installedXrayRelease(p.GetVersion(), p.GetBuild())
+}
+
+// installedXrayRelease reads the fork's "<tag>-ariansharifi" build field; a fork build outside a release has no tag.
+func installedXrayRelease(version, build string) XrayRelease {
+	if tag, ok := strings.CutSuffix(build, xrayForkBuildSuffix); ok {
+		if !strings.HasPrefix(tag, "v") {
+			tag = ""
+		}
+		return XrayRelease{Version: tag, Repo: xrayReleaseRepo}
+	}
+	return XrayRelease{Version: "v" + version, Repo: upstreamXrayReleaseRepo}
 }
 
 // RemoveIndex removes an element at the specified index from a slice.

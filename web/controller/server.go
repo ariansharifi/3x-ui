@@ -26,7 +26,7 @@ type ServerController struct {
 
 	lastStatus *service.Status
 
-	lastVersions        []string
+	lastVersions        []service.XrayRelease
 	lastGetVersionsTime int64 // unix seconds
 }
 
@@ -147,7 +147,7 @@ func (a *ServerController) getPanelUpdateInfo(c *gin.Context) {
 // installXray installs or updates Xray to the specified version.
 func (a *ServerController) installXray(c *gin.Context) {
 	version := c.Param("version")
-	err := a.serverService.UpdateXray(version)
+	err := a.serverService.UpdateXray(version, c.PostForm("repo"))
 	jsonMsg(c, I18nWeb(c, "pages.index.xraySwitchVersionPopover"), err)
 }
 

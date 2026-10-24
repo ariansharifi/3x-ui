@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -70,6 +72,8 @@ type Status struct {
 		State    ProcessState `json:"state"`
 		ErrorMsg string       `json:"errorMsg"`
 		Version  string       `json:"version"`
+		Release  string       `json:"release"`
+		Repo     string       `json:"repo"`
 	} `json:"xray"`
 	Uptime   uint64    `json:"uptime"`
 	Loads    []float64 `json:"loads"`
@@ -402,6 +406,8 @@ func (s *ServerService) GetStatus(lastStatus *Status) *Status {
 		status.Xray.ErrorMsg = s.xrayService.GetXrayResult()
 	}
 	status.Xray.Version = s.xrayService.GetXrayVersion()
+	installed := s.xrayService.GetInstalledXrayRelease()
+	status.Xray.Release, status.Xray.Repo = installed.Version, installed.Repo
 
 	// Application stats
 	var rtm runtime.MemStats
@@ -517,17 +523,53 @@ func (s *ServerService) sampleCPUUtilization() (float64, error) {
 	return s.emaCPU, nil
 }
 
-// xrayReleaseRepo serves the panel's Xray builds: upstream plus the VLESS fix that closes a removed user's connections.
-// Switching to an upstream XTLS build would bring back "a disabled user keeps relaying until idle timeout".
-const xrayReleaseRepo = "ariansharifi/Xray-core"
+// xrayReleaseRepo is the default Xray source: upstream plus the VLESS fix that closes a removed user's connections.
+// Its release builds stamp the build field "<tag>"+xrayForkBuildSuffix, as fork and upstream share core versions.
+const (
+	xrayReleaseRepo         = "ariansharifi/Xray-core"
+	upstreamXrayReleaseRepo = "XTLS/Xray-core"
+	xrayForkBuildSuffix     = "-ariansharifi"
+)
 
-func (s *ServerService) GetXrayVersions() ([]string, error) {
-	const (
-		XrayURL    = "https://api.github.com/repos/" + xrayReleaseRepo + "/releases"
-		bufferSize = 8192
-	)
+// xrayReleaseRepos are the only repos the version switcher lists and installs from, fork first.
+var xrayReleaseRepos = []string{xrayReleaseRepo, upstreamXrayReleaseRepo}
 
-	resp, err := http.Get(XrayURL)
+var (
+	githubAPIBaseURL = "https://api.github.com"
+	githubBaseURL    = "https://github.com"
+)
+
+// XrayRelease is one installable Xray version and the repo it is downloaded from.
+type XrayRelease struct {
+	Version string `json:"version"`
+	Repo    string `json:"repo"`
+}
+
+// GetXrayVersions lists installable releases of every repo in xrayReleaseRepos; one unreachable repo does not hide the others.
+func (s *ServerService) GetXrayVersions() ([]XrayRelease, error) {
+	var releases []XrayRelease
+	var errs []error
+	for _, repo := range xrayReleaseRepos {
+		versions, err := fetchXrayVersions(repo)
+		if err != nil {
+			logger.Warning("list Xray releases of", repo, "failed:", err)
+			errs = append(errs, fmt.Errorf("%s: %w", repo, err))
+			continue
+		}
+		for _, version := range versions {
+			releases = append(releases, XrayRelease{Version: version, Repo: repo})
+		}
+	}
+	if len(errs) == len(xrayReleaseRepos) {
+		return nil, errors.Join(errs...)
+	}
+	return releases, nil
+}
+
+func fetchXrayVersions(repo string) ([]string, error) {
+	const bufferSize = 8192
+
+	resp, err := http.Get(githubAPIBaseURL + "/repos/" + repo + "/releases")
 	if err != nil {
 		return nil, err
 	}
@@ -596,7 +638,15 @@ func (s *ServerService) RestartXrayService() error {
 	return nil
 }
 
-func (s *ServerService) downloadXRay(version string) (string, error) {
+// downloadXRay fetches the release zip of version from repo; an empty repo means xrayReleaseRepo.
+func (s *ServerService) downloadXRay(version string, repo string) (string, error) {
+	if repo == "" {
+		repo = xrayReleaseRepo
+	}
+	if !slices.Contains(xrayReleaseRepos, repo) {
+		return "", fmt.Errorf("%q is not an allowed Xray release repo", repo)
+	}
+
 	osName := runtime.GOOS
 	arch := runtime.GOARCH
 
@@ -625,12 +675,15 @@ func (s *ServerService) downloadXRay(version string) (string, error) {
 	}
 
 	fileName := fmt.Sprintf("Xray-%s-%s.zip", osName, arch)
-	url := fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", xrayReleaseRepo, version, fileName)
+	url := fmt.Sprintf("%s/%s/releases/download/%s/%s", githubBaseURL, repo, version, fileName)
 	resp, err := http.Get(url)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("download %s: %s", url, resp.Status)
+	}
 
 	os.Remove(fileName)
 	file, err := os.Create(fileName)
@@ -647,14 +700,9 @@ func (s *ServerService) downloadXRay(version string) (string, error) {
 	return fileName, nil
 }
 
-func (s *ServerService) UpdateXray(version string) error {
-	// 1. Stop xray before doing anything
-	if err := s.StopXrayService(); err != nil {
-		logger.Warning("failed to stop xray before update:", err)
-	}
-
-	// 2. Download the zip
-	zipFileName, err := s.downloadXRay(version)
+func (s *ServerService) UpdateXray(version string, repo string) error {
+	// 1. Download and open the zip first, so a missing or broken release leaves the running xray alone
+	zipFileName, err := s.downloadXRay(version, repo)
 	if err != nil {
 		return err
 	}
@@ -673,6 +721,11 @@ func (s *ServerService) UpdateXray(version string) error {
 	reader, err := zip.NewReader(zipFile, stat.Size())
 	if err != nil {
 		return err
+	}
+
+	// 2. Stop xray before replacing its binary
+	if err := s.StopXrayService(); err != nil {
+		logger.Warning("failed to stop xray before update:", err)
 	}
 
 	// 3. Helper to extract files

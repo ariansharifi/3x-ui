@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strings"
 	"syscall"
@@ -123,6 +124,7 @@ type process struct {
 	cmd *exec.Cmd
 
 	version string
+	build   string
 	apiPort int
 
 	onlineClients []string
@@ -182,6 +184,11 @@ func (p *process) GetVersion() string {
 	return p.version
 }
 
+// GetBuild returns the build field of the Xray binary's version output, empty if it was not found.
+func (p *process) GetBuild() string {
+	return p.build
+}
+
 // GetAPIPort returns the API port used by the Xray process.
 func (p *Process) GetAPIPort() int {
 	return p.apiPort
@@ -231,7 +238,14 @@ func (p *process) refreshVersion() {
 			p.version = string(datas[1])
 		}
 	}
+	p.build = ""
+	if m := xrayBuildPattern.FindSubmatch(data); m != nil {
+		p.build = string(m[1])
+	}
 }
+
+// xrayBuildPattern captures the build field of "Xray 26.10.21 (Xray, Penetrates Everything.) 4f65bc97 (go1.27 ...)".
+var xrayBuildPattern = regexp.MustCompile(`^Xray \S+ \([^)]*\) (\S+) \(`)
 
 // Start launches the Xray process with the current configuration.
 func (p *process) Start() (err error) {

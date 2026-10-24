@@ -361,10 +361,14 @@
         <a-alert type="warning" class="mb-12 w-100" message='{{ i18n "pages.index.xraySwitchClickDesk" }}'
           show-icon></a-alert>
         <a-list class="ant-version-list w-100" bordered>
-          <a-list-item class="ant-version-list-item" v-for="version, index in versionModal.versions">
-            <a-tag :color="index % 2 == 0 ? 'purple' : 'green'">[[ version ]]</a-tag>
-            <a-radio :class="themeSwitcher.currentTheme" :checked="version === `v${status.xray.version}`"
-              @click="switchV2rayVersion(version)"></a-radio>
+          <a-list-item class="ant-version-list-item" v-for="release, index in versionModal.versions">
+            <span>
+              <a-tag :color="index % 2 == 0 ? 'purple' : 'green'">[[ release.version ]]</a-tag>
+              <a-tag>[[ release.repo ]]</a-tag>
+            </span>
+            <a-radio :class="themeSwitcher.currentTheme"
+              :checked="release.version === status.xray.release && release.repo === status.xray.repo"
+              @click="switchV2rayVersion(release)"></a-radio>
           </a-list-item>
         </a-list>
       </a-collapse-panel>
@@ -886,6 +890,8 @@
         stateMsg: "",
         errorMsg: "",
         version: "",
+        release: "",
+        repo: "",
         color: ""
       };
 
@@ -1383,17 +1389,17 @@
           this.customGeoUpdatingAll = false;
         }
       },
-      switchV2rayVersion(version) {
+      switchV2rayVersion(release) {
         this.$confirm({
           title: '{{ i18n "pages.index.xraySwitchVersionDialog"}}',
-          content: '{{ i18n "pages.index.xraySwitchVersionDialogDesc"}}'.replace('#version#', version),
+          content: '{{ i18n "pages.index.xraySwitchVersionDialogDesc"}}'.replace('#version#', `${release.version} (${release.repo})`),
           okText: '{{ i18n "confirm"}}',
           class: themeSwitcher.currentTheme,
           cancelText: '{{ i18n "cancel"}}',
           onOk: async () => {
             versionModal.hide();
             this.loading(true, '{{ i18n "pages.index.dontRefresh"}}');
-            await HttpUtil.post(`/panel/api/server/installXray/${version}`);
+            await HttpUtil.post(`/panel/api/server/installXray/${release.version}`, { repo: release.repo });
             this.loading(false);
           },
         });
