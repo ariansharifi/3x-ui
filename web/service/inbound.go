@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,6 +27,13 @@ import (
 // One instance serves concurrent requests, so it must not hold per-call state such as an Xray API client.
 type InboundService struct {
 }
+
+// inboundWriteMu serializes every read-modify-write of an inbound row. Clients live inside the inbound's
+// settings JSON, so each client change loads the whole list, edits it and saves it back; two overlapping
+// changes (concurrent API calls, or one racing the traffic job) would otherwise each save their own copy
+// and the later one would silently drop the other's edit. Held by the outermost exported method only:
+// the methods taking it never call one another.
+var inboundWriteMu sync.Mutex
 
 type CopyClientsResult struct {
 	Added   []string `json:"added"`
@@ -148,6 +156,42 @@ func (s *InboundService) GetClients(inbound *model.Inbound) ([]model.Client, err
 	return clients, nil
 }
 
+// rawSettings is an inbound's settings with each client left as undecoded JSON. Adding or editing one
+// client this way skips decoding tens of thousands of others into maps and encoding them back, which
+// costs about twice the time and forty times the allocations, and it keeps their bytes exactly as stored.
+type rawSettings struct {
+	fields  map[string]json.RawMessage
+	clients []json.RawMessage
+}
+
+func parseRawSettings(settings string) (*rawSettings, error) {
+	rs := &rawSettings{}
+	if err := json.Unmarshal([]byte(settings), &rs.fields); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(rs.fields["clients"], &rs.clients); err != nil {
+		return nil, fmt.Errorf("inbound settings clients: %w", err)
+	}
+	return rs, nil
+}
+
+func (rs *rawSettings) encode() (string, error) {
+	clients, err := json.Marshal(rs.clients)
+	if err != nil {
+		return "", err
+	}
+	rs.fields["clients"] = clients
+	out, err := json.Marshal(rs.fields)
+	return string(out), err
+}
+
+// stringField returns a top-level string setting, such as a shadowsocks inbound's "method".
+func (rs *rawSettings) stringField(key string) string {
+	var v string
+	json.Unmarshal(rs.fields[key], &v)
+	return v
+}
+
 func (s *InboundService) getAllEmails() ([]string, error) {
 	db := database.GetDB()
 	var emails []string
@@ -221,6 +265,8 @@ func (s *InboundService) checkEmailExistForInbound(inbound *model.Inbound) (stri
 // then saves the inbound to the database and optionally adds it to the running Xray instance.
 // Returns the created inbound, whether Xray needs restart, and any error.
 func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, bool, error) {
+	inboundWriteMu.Lock()
+	defer inboundWriteMu.Unlock()
 	exist, err := s.checkPortExist(inbound.Listen, inbound.Port, 0)
 	if err != nil {
 		return inbound, false, err
@@ -256,7 +302,7 @@ func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, boo
 				updatedClients = append(updatedClients, c)
 			}
 			settings["clients"] = updatedClients
-			if bs, err3 := json.MarshalIndent(settings, "", "  "); err3 == nil {
+			if bs, err3 := json.Marshal(settings); err3 == nil {
 				inbound.Settings = string(bs)
 			} else {
 				logger.Debug("Unable to marshal inbound settings with timestamps:", err3)
@@ -313,7 +359,7 @@ func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, boo
 	if inbound.Enable {
 		xrayApi := new(xray.XrayAPI)
 		xrayApi.Init(p.GetAPIPort())
-		inboundJson, err1 := json.MarshalIndent(inbound.GenXrayInboundConfig(), "", "  ")
+		inboundJson, err1 := json.Marshal(inbound.GenXrayInboundConfig())
 		if err1 != nil {
 			logger.Debug("Unable to marshal inbound config:", err1)
 		}
@@ -335,8 +381,14 @@ func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, boo
 // It removes the inbound from the database and the running Xray instance if active.
 // Returns whether Xray needs restart and any error.
 func (s *InboundService) DelInbound(id int) (bool, error) {
-	db := database.GetDB()
+	inboundWriteMu.Lock()
+	defer inboundWriteMu.Unlock()
+	return s.delInbound(database.GetDB(), id)
+}
 
+// delInbound runs every query on db, so a caller inside a transaction passes its tx: with BEGIN
+// IMMEDIATE that transaction holds the write lock, and a write on another connection would wait it out.
+func (s *InboundService) delInbound(db *gorm.DB, id int) (bool, error) {
 	var tag string
 	needRestart := false
 	result := db.Model(model.Inbound{}).Select("tag").Where("id = ? and enable = ?", id, true).First(&tag)
@@ -360,8 +412,8 @@ func (s *InboundService) DelInbound(id int) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	inbound, err := s.GetInbound(id)
-	if err != nil {
+	inbound := &model.Inbound{}
+	if err := db.Model(model.Inbound{}).First(inbound, id).Error; err != nil {
 		return false, err
 	}
 	clients, err := s.GetClients(inbound)
@@ -449,7 +501,7 @@ func (s *InboundService) SetInboundEnable(id int, enable bool) (bool, error) {
 		logger.Debug("SetInboundEnable: build runtime config failed:", err)
 		return true, nil
 	}
-	inboundJson, err := json.MarshalIndent(runtimeInbound.GenXrayInboundConfig(), "", "  ")
+	inboundJson, err := json.Marshal(runtimeInbound.GenXrayInboundConfig())
 	if err != nil {
 		logger.Debug("SetInboundEnable: marshal runtime config failed:", err)
 		return true, nil
@@ -465,6 +517,8 @@ func (s *InboundService) SetInboundEnable(id int, enable bool) (bool, error) {
 // It validates changes, updates the database, and syncs with the running Xray instance.
 // Returns the updated inbound, whether Xray needs restart, and any error.
 func (s *InboundService) UpdateInbound(inbound *model.Inbound) (*model.Inbound, bool, error) {
+	inboundWriteMu.Lock()
+	defer inboundWriteMu.Unlock()
 	exist, err := s.checkPortExist(inbound.Listen, inbound.Port, inbound.Id)
 	if err != nil {
 		return inbound, false, err
@@ -548,7 +602,7 @@ func (s *InboundService) UpdateInbound(inbound *model.Inbound) (*model.Inbound, 
 					}
 				}
 				newSettings["clients"] = nSlice
-				if bs, err3 := json.MarshalIndent(newSettings, "", "  "); err3 == nil {
+				if bs, err3 := json.Marshal(newSettings); err3 == nil {
 					inbound.Settings = string(bs)
 				}
 			}
@@ -586,7 +640,7 @@ func (s *InboundService) UpdateInbound(inbound *model.Inbound) (*model.Inbound, 
 			logger.Debug("Unable to prepare runtime inbound config:", err2)
 			needRestart = true
 		} else {
-			inboundJson, err2 := json.MarshalIndent(runtimeInbound.GenXrayInboundConfig(), "", "  ")
+			inboundJson, err2 := json.Marshal(runtimeInbound.GenXrayInboundConfig())
 			if err2 != nil {
 				logger.Debug("Unable to marshal updated inbound config:", err2)
 				needRestart = true
@@ -656,7 +710,7 @@ func (s *InboundService) buildRuntimeInboundForAPI(tx *gorm.DB, inbound *model.I
 	}
 
 	settings["clients"] = finalClients
-	modifiedSettings, err := json.MarshalIndent(settings, "", "  ")
+	modifiedSettings, err := json.Marshal(settings)
 	if err != nil {
 		return nil, err
 	}
@@ -728,6 +782,8 @@ func (s *InboundService) updateClientTraffics(tx *gorm.DB, oldInbound *model.Inb
 }
 
 func (s *InboundService) AddInboundClient(data *model.Inbound) (bool, error) {
+	inboundWriteMu.Lock()
+	defer inboundWriteMu.Unlock()
 	clients, err := s.GetClients(data)
 	if err != nil {
 		return false, err
@@ -786,23 +842,24 @@ func (s *InboundService) AddInboundClient(data *model.Inbound) (bool, error) {
 		}
 	}
 
-	var oldSettings map[string]any
-	err = json.Unmarshal([]byte(oldInbound.Settings), &oldSettings)
+	oldSettings, err := parseRawSettings(oldInbound.Settings)
+	if err != nil {
+		return false, err
+	}
+	for _, c := range interfaceClients {
+		raw, err := json.Marshal(c)
+		if err != nil {
+			return false, err
+		}
+		oldSettings.clients = append(oldSettings.clients, raw)
+	}
+
+	newSettings, err := oldSettings.encode()
 	if err != nil {
 		return false, err
 	}
 
-	oldClients := oldSettings["clients"].([]any)
-	oldClients = append(oldClients, interfaceClients...)
-
-	oldSettings["clients"] = oldClients
-
-	newSettings, err := json.MarshalIndent(oldSettings, "", "  ")
-	if err != nil {
-		return false, err
-	}
-
-	oldInbound.Settings = string(newSettings)
+	oldInbound.Settings = newSettings
 
 	db := database.GetDB()
 	tx := db.Begin()
@@ -824,7 +881,7 @@ func (s *InboundService) AddInboundClient(data *model.Inbound) (bool, error) {
 			if client.Enable {
 				cipher := ""
 				if oldInbound.Protocol == "shadowsocks" {
-					cipher = oldSettings["method"].(string)
+					cipher = oldSettings.stringField("method")
 				}
 				err1 := xrayApi.AddUser(string(oldInbound.Protocol), oldInbound.Tag, map[string]any{
 					"email":    client.Email,
@@ -1048,6 +1105,8 @@ func (s *InboundService) CopyInboundClients(targetInboundID int, sourceInboundID
 }
 
 func (s *InboundService) DelInboundClient(inboundId int, clientId string) (bool, error) {
+	inboundWriteMu.Lock()
+	defer inboundWriteMu.Unlock()
 	oldInbound, err := s.GetInbound(inboundId)
 	if err != nil {
 		logger.Error("Load Old Data Error")
@@ -1095,7 +1154,7 @@ func (s *InboundService) DelInboundClient(inboundId int, clientId string) (bool,
 	}
 
 	settings["clients"] = newClients
-	newSettings, err := json.MarshalIndent(settings, "", "  ")
+	newSettings, err := json.Marshal(settings)
 	if err != nil {
 		return false, err
 	}
@@ -1145,6 +1204,8 @@ func (s *InboundService) DelInboundClient(inboundId int, clientId string) (bool,
 }
 
 func (s *InboundService) UpdateInboundClient(data *model.Inbound, clientId string) (bool, error) {
+	inboundWriteMu.Lock()
+	defer inboundWriteMu.Unlock()
 	// TODO: check if TrafficReset field is updating
 	clients, err := s.GetClients(data)
 	if err != nil {
@@ -1210,20 +1271,20 @@ func (s *InboundService) UpdateInboundClient(data *model.Inbound, clientId strin
 		}
 	}
 
-	var oldSettings map[string]any
-	err = json.Unmarshal([]byte(oldInbound.Settings), &oldSettings)
+	oldSettings, err := parseRawSettings(oldInbound.Settings)
 	if err != nil {
 		return false, err
 	}
-	settingsClients := oldSettings["clients"].([]any)
+	if clientIndex >= len(oldSettings.clients) {
+		return false, common.NewError("Client Not Found In Inbound For ID:", clientId)
+	}
 	// Preserve created_at and set updated_at for the replacing client
 	var preservedCreated any
-	if clientIndex >= 0 && clientIndex < len(settingsClients) {
-		if oldMap, ok := settingsClients[clientIndex].(map[string]any); ok {
-			if v, ok2 := oldMap["created_at"]; ok2 {
-				preservedCreated = v
-			}
-		}
+	var oldStamps struct {
+		CreatedAt json.RawMessage `json:"created_at"`
+	}
+	if json.Unmarshal(oldSettings.clients[clientIndex], &oldStamps) == nil && oldStamps.CreatedAt != nil {
+		preservedCreated = oldStamps.CreatedAt
 	}
 	if len(interfaceClients) > 0 {
 		if newMap, ok := interfaceClients[0].(map[string]any); ok {
@@ -1235,15 +1296,17 @@ func (s *InboundService) UpdateInboundClient(data *model.Inbound, clientId strin
 			interfaceClients[0] = newMap
 		}
 	}
-	settingsClients[clientIndex] = interfaceClients[0]
-	oldSettings["clients"] = settingsClients
-
-	newSettings, err := json.MarshalIndent(oldSettings, "", "  ")
+	oldSettings.clients[clientIndex], err = json.Marshal(interfaceClients[0])
 	if err != nil {
 		return false, err
 	}
 
-	oldInbound.Settings = string(newSettings)
+	newSettings, err := oldSettings.encode()
+	if err != nil {
+		return false, err
+	}
+
+	oldInbound.Settings = newSettings
 	db := database.GetDB()
 	tx := db.Begin()
 
@@ -1301,7 +1364,7 @@ func (s *InboundService) UpdateInboundClient(data *model.Inbound, clientId strin
 		if clients[0].Enable {
 			cipher := ""
 			if oldInbound.Protocol == "shadowsocks" {
-				cipher = oldSettings["method"].(string)
+				cipher = oldSettings.stringField("method")
 			}
 			err1 := xrayApi.AddUser(string(oldInbound.Protocol), oldInbound.Tag, map[string]any{
 				"email":    clients[0].Email,
@@ -1345,6 +1408,8 @@ func xrayUserChanged(old, updated model.Client) bool {
 }
 
 func (s *InboundService) AddTraffic(inboundTraffics []*xray.Traffic, clientTraffics []*xray.ClientTraffic) (bool, bool, error) {
+	inboundWriteMu.Lock()
+	defer inboundWriteMu.Unlock()
 	var err error
 	db := database.GetDB()
 	tx := db.Begin()
@@ -1365,29 +1430,46 @@ func (s *InboundService) AddTraffic(inboundTraffics []*xray.Traffic, clientTraff
 		return false, false, err
 	}
 
-	needRestart0, count, err := s.autoRenewClients(tx)
-	if err != nil {
-		logger.Warning("Error in renew clients:", err)
+	// The steps below only log their errors, so each gets its own savepoint and its own error variable:
+	// a failed one is undone alone instead of leaving err set and rolling back the traffic counted above.
+	// Xray resets its counters on every read, so a rolled-back interval is usage lost for good.
+	needRestart0, count, stepErr := inSavepoint(tx, "renew_clients", s.autoRenewClients)
+	if stepErr != nil {
+		logger.Warning("Error in renew clients:", stepErr)
 	} else if count > 0 {
 		logger.Debugf("%v clients renewed", count)
 	}
 
 	disabledClientsCount := int64(0)
-	needRestart1, count, err := s.disableInvalidClients(tx)
-	if err != nil {
-		logger.Warning("Error in disabling invalid clients:", err)
+	needRestart1, count, stepErr := inSavepoint(tx, "disable_clients", s.disableInvalidClients)
+	if stepErr != nil {
+		logger.Warning("Error in disabling invalid clients:", stepErr)
 	} else if count > 0 {
 		logger.Debugf("%v clients disabled", count)
 		disabledClientsCount = count
 	}
 
-	needRestart2, count, err := s.disableInvalidInbounds(tx)
-	if err != nil {
-		logger.Warning("Error in disabling invalid inbounds:", err)
+	needRestart2, count, stepErr := inSavepoint(tx, "disable_inbounds", s.disableInvalidInbounds)
+	if stepErr != nil {
+		logger.Warning("Error in disabling invalid inbounds:", stepErr)
 	} else if count > 0 {
 		logger.Debugf("%v inbounds disabled", count)
 	}
 	return needRestart0 || needRestart1 || needRestart2, disabledClientsCount > 0, nil
+}
+
+// inSavepoint runs one AddTraffic follow-up step and rolls back only that step's writes if it fails.
+func inSavepoint(tx *gorm.DB, name string, step func(*gorm.DB) (bool, int64, error)) (bool, int64, error) {
+	if err := tx.SavePoint(name).Error; err != nil {
+		return false, 0, err
+	}
+	needRestart, count, err := step(tx)
+	if err != nil {
+		if rbErr := tx.RollbackTo(name).Error; rbErr != nil {
+			logger.Warning("rollback to savepoint", name, "failed:", rbErr)
+		}
+	}
+	return needRestart, count, err
 }
 
 func (s *InboundService) addInboundTraffic(tx *gorm.DB, traffics []*xray.Traffic) error {
@@ -1519,7 +1601,7 @@ func (s *InboundService) adjustTraffics(tx *gorm.DB, dbClientTraffics []*xray.Cl
 					newClients = append(newClients, any(c))
 				}
 				settings["clients"] = newClients
-				modifiedSettings, err := json.MarshalIndent(settings, "", "  ")
+				modifiedSettings, err := json.Marshal(settings)
 				if err != nil {
 					return nil, err
 				}
@@ -1611,7 +1693,7 @@ func (s *InboundService) autoRenewClients(tx *gorm.DB) (bool, int64, error) {
 			}
 		}
 		settings["clients"] = clients
-		newSettings, err := json.MarshalIndent(settings, "", "  ")
+		newSettings, err := json.Marshal(settings)
 		if err != nil {
 			return false, 0, err
 		}
@@ -1768,7 +1850,7 @@ func (s *InboundService) disableInvalidClients(tx *gorm.DB) (bool, int64, error)
 			}
 			if changed {
 				settings["clients"] = clients
-				modifiedSettings, jsonErr := json.MarshalIndent(settings, "", "  ")
+				modifiedSettings, jsonErr := json.Marshal(settings)
 				if jsonErr != nil {
 					continue
 				}
@@ -1970,7 +2052,7 @@ func (s *InboundService) SetClientTelegramUserID(trafficId int, tgId int64) (boo
 		}
 	}
 	settings["clients"] = newClients
-	modifiedSettings, err := json.MarshalIndent(settings, "", "  ")
+	modifiedSettings, err := json.Marshal(settings)
 	if err != nil {
 		return false, err
 	}
@@ -2057,7 +2139,7 @@ func (s *InboundService) ToggleClientEnableByEmail(clientEmail string) (bool, bo
 		}
 	}
 	settings["clients"] = newClients
-	modifiedSettings, err := json.MarshalIndent(settings, "", "  ")
+	modifiedSettings, err := json.Marshal(settings)
 	if err != nil {
 		return false, false, err
 	}
@@ -2137,7 +2219,7 @@ func (s *InboundService) ResetClientIpLimitByEmail(clientEmail string, count int
 		}
 	}
 	settings["clients"] = newClients
-	modifiedSettings, err := json.MarshalIndent(settings, "", "  ")
+	modifiedSettings, err := json.Marshal(settings)
 	if err != nil {
 		return false, err
 	}
@@ -2196,7 +2278,7 @@ func (s *InboundService) ResetClientExpiryTimeByEmail(clientEmail string, expiry
 		}
 	}
 	settings["clients"] = newClients
-	modifiedSettings, err := json.MarshalIndent(settings, "", "  ")
+	modifiedSettings, err := json.Marshal(settings)
 	if err != nil {
 		return false, err
 	}
@@ -2258,7 +2340,7 @@ func (s *InboundService) ResetClientTrafficLimitByEmail(clientEmail string, tota
 		}
 	}
 	settings["clients"] = newClients
-	modifiedSettings, err := json.MarshalIndent(settings, "", "  ")
+	modifiedSettings, err := json.Marshal(settings)
 	if err != nil {
 		return false, err
 	}
@@ -2406,6 +2488,8 @@ func (s *InboundService) ResetInboundTraffic(id int) error {
 }
 
 func (s *InboundService) DelDepletedClients(id int) (err error) {
+	inboundWriteMu.Lock()
+	defer inboundWriteMu.Unlock()
 	db := database.GetDB()
 	tx := db.Begin()
 	defer func() {
@@ -2436,7 +2520,10 @@ func (s *InboundService) DelDepletedClients(id int) (err error) {
 	}
 
 	for _, depletedClient := range depletedClients {
-		emails := strings.Split(depletedClient.Email, ",")
+		depleted := make(map[string]struct{})
+		for _, email := range strings.Split(depletedClient.Email, ",") {
+			depleted[email] = struct{}{}
+		}
 		oldInbound, err := s.GetInbound(depletedClient.InboundId)
 		if err != nil {
 			return err
@@ -2450,22 +2537,15 @@ func (s *InboundService) DelDepletedClients(id int) (err error) {
 		oldClients := oldSettings["clients"].([]any)
 		var newClients []any
 		for _, client := range oldClients {
-			deplete := false
 			c := client.(map[string]any)
-			for _, email := range emails {
-				if email == c["email"].(string) {
-					deplete = true
-					break
-				}
-			}
-			if !deplete {
+			if _, deplete := depleted[c["email"].(string)]; !deplete {
 				newClients = append(newClients, client)
 			}
 		}
 		if len(newClients) > 0 {
 			oldSettings["clients"] = newClients
 
-			newSettings, err := json.MarshalIndent(oldSettings, "", "  ")
+			newSettings, err := json.Marshal(oldSettings)
 			if err != nil {
 				return err
 			}
@@ -2477,7 +2557,9 @@ func (s *InboundService) DelDepletedClients(id int) (err error) {
 			}
 		} else {
 			// Delete inbound if no client remains
-			s.DelInbound(depletedClient.InboundId)
+			if _, err := s.delInbound(tx, depletedClient.InboundId); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -2941,7 +3023,7 @@ func (s *InboundService) MigrationRequirements() {
 				newClients = append(newClients, any(c))
 			}
 			settings["clients"] = newClients
-			modifiedSettings, err := json.MarshalIndent(settings, "", "  ")
+			modifiedSettings, err := json.Marshal(settings)
 			if err != nil {
 				return
 			}
@@ -3079,6 +3161,8 @@ func (s *InboundService) FilterAndSortClientEmails(emails []string) ([]string, [
 	return validEmails, extraEmails, nil
 }
 func (s *InboundService) DelInboundClientByEmail(inboundId int, email string) (bool, error) {
+	inboundWriteMu.Lock()
+	defer inboundWriteMu.Unlock()
 	oldInbound, err := s.GetInbound(inboundId)
 	if err != nil {
 		logger.Error("Load Old Data Error")
@@ -3121,7 +3205,7 @@ func (s *InboundService) DelInboundClientByEmail(inboundId int, email string) (b
 	}
 
 	settings["clients"] = newClients
-	newSettings, err := json.MarshalIndent(settings, "", "  ")
+	newSettings, err := json.Marshal(settings)
 	if err != nil {
 		return false, err
 	}
