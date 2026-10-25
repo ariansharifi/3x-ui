@@ -11,6 +11,8 @@ import (
 	"os"
 	"path"
 	"slices"
+	"strings"
+	"sync/atomic"
 
 	"github.com/mhsanaei/3x-ui/v2/config"
 	"github.com/mhsanaei/3x-ui/v2/database/model"
@@ -23,6 +25,10 @@ import (
 )
 
 var db *gorm.DB
+
+// epoch moves each time InitDB opens a database. A cache keyed on InboundsVersion pairs it with the
+// epoch, because an imported database brings its own counter, which may be lower than the one cached.
+var epoch atomic.Int64
 
 const (
 	defaultUsername = "admin"
@@ -143,8 +149,12 @@ func InitDB(dbPath string) error {
 	if err != nil {
 		return err
 	}
+	epoch.Add(1)
 
 	if err := initModels(); err != nil {
+		return err
+	}
+	if err := initInboundsVersion(); err != nil {
 		return err
 	}
 
@@ -157,6 +167,57 @@ func InitDB(dbPath string) error {
 		return err
 	}
 	return runSeeders(isUsersEmpty)
+}
+
+// inboundsUnwatchedColumns never move the version: the traffic counters change on every tick and say
+// nothing about how to reach an inbound, and id never changes.
+var inboundsUnwatchedColumns = []string{"id", "up", "down", "all_time"}
+
+// initInboundsVersion keeps a counter that triggers move on any change to an inbound except its traffic
+// counters, so a cache built from inbounds can tell it is stale whoever wrote: this process, the x-ui
+// CLI or a hand edit. The update trigger is recreated on every start so it covers columns that later
+// migrations add.
+func initInboundsVersion() error {
+	var columns []string
+	if err := db.Raw("SELECT name FROM pragma_table_info('inbounds')").Scan(&columns).Error; err != nil {
+		return err
+	}
+	var watched []string
+	for _, c := range columns {
+		if !slices.Contains(inboundsUnwatchedColumns, c) {
+			watched = append(watched, `"`+c+`"`)
+		}
+	}
+	const bump = "BEGIN UPDATE inbounds_version SET version = version + 1 WHERE id = 1; END"
+	return db.Transaction(func(tx *gorm.DB) error {
+		for _, stmt := range []string{
+			"CREATE TABLE IF NOT EXISTS inbounds_version (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL)",
+			"INSERT OR IGNORE INTO inbounds_version (id, version) VALUES (1, 0)",
+			"DROP TRIGGER IF EXISTS inbounds_version_insert",
+			"DROP TRIGGER IF EXISTS inbounds_version_update",
+			"DROP TRIGGER IF EXISTS inbounds_version_delete",
+			"CREATE TRIGGER inbounds_version_insert AFTER INSERT ON inbounds " + bump,
+			"CREATE TRIGGER inbounds_version_update AFTER UPDATE OF " + strings.Join(watched, ", ") + " ON inbounds " + bump,
+			"CREATE TRIGGER inbounds_version_delete AFTER DELETE ON inbounds " + bump,
+		} {
+			if err := tx.Exec(stmt).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// InboundsVersion returns the counter initInboundsVersion's triggers move.
+func InboundsVersion() (int64, error) {
+	var version int64
+	err := db.Raw("SELECT version FROM inbounds_version WHERE id = 1").Scan(&version).Error
+	return version, err
+}
+
+// Epoch identifies the database InitDB last opened; see epoch.
+func Epoch() int64 {
+	return epoch.Load()
 }
 
 // sqliteDSN opens every pooled connection in WAL mode, so readers never block the writer, and makes

@@ -119,21 +119,26 @@ func (s *SubService) GetSubs(subId string, host string) ([]string, int64, xray.C
 	return result, lastOnline, traffic, nil
 }
 
+// getInboundsBySubId returns the enabled inbounds that hold a client with this subId, each trimmed to
+// just those clients and their stats rows (see subIndex).
 func (s *SubService) getInboundsBySubId(subId string) ([]*model.Inbound, error) {
-	db := database.GetDB()
-	var inbounds []*model.Inbound
-	// allow "hysteria2" so imports stored with the literal v2 protocol
-	// string still surface here (#4081)
-	err := db.Model(model.Inbound{}).Preload("ClientStats").Where(`id in (
-		SELECT DISTINCT inbounds.id
-		FROM inbounds,
-			JSON_EACH(JSON_EXTRACT(inbounds.settings, '$.clients')) AS client
-		WHERE
-			protocol in ('vmess','vless','trojan','shadowsocks','hysteria','hysteria2')
-			AND JSON_EXTRACT(client.value, '$.subId') = ? AND enable = ?
-	)`, subId, true).Find(&inbounds).Error
+	idx, err := currentSubIndex()
 	if err != nil {
 		return nil, err
+	}
+	matches := idx.bySubID[subId]
+	var inbounds []*model.Inbound
+	for start := 0; start < len(matches); {
+		end := start + 1
+		for end < len(matches) && matches[end].inboundID == matches[start].inboundID {
+			end++
+		}
+		inbound, err := idx.inbounds[matches[start].inboundID].withClients(matches[start:end])
+		if err != nil {
+			return nil, err
+		}
+		inbounds = append(inbounds, inbound)
+		start = end
 	}
 	return inbounds, nil
 }
