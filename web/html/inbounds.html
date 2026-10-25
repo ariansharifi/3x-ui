@@ -198,7 +198,8 @@
                   </div>
                   <a-table :columns="isMobile ? mobileColumns : columns" :row-key="dbInbound => dbInbound.id"
                     :data-source="searchedInbounds" :scroll="isMobile ? {} : { x: 1000 }"
-                    :pagination=pagination(searchedInbounds) :expand-icon-as-cell="false" :expand-row-by-click="false"
+                    :pagination="pagination(searchedInbounds, 'inbounds')" @change="rememberPage('inbounds', $event)"
+                    :expand-icon-as-cell="false" :expand-row-by-click="false"
                     :expand-icon-column-index="0" :indent-size="0"
                     :row-class-name="dbInbound => (dbInbound.isMultiUser() ? '' : 'hideExpandIcon')"
                     :style="{ marginTop: '10px' }"
@@ -646,7 +647,8 @@
                       <a-table :row-key="client => client.id"
                         :columns="isMobile ? innerMobileColumns : innerColumns"
                         :data-source="getInboundClients(record)"
-                        :pagination=pagination(getInboundClients(record))
+                        :pagination="pagination(getInboundClients(record), 'clients-' + record.id)"
+                        @change="rememberPage('clients-' + record.id, $event)"
                         :scroll="isMobile ? {} : { x: 'max-content' }"
                         :style="{ margin: `-10px ${isMobile ? '2px' : '22px'} -11px` }">
                         {{template "component/aClientTable" .}}
@@ -1064,6 +1066,7 @@
       showAlert: false,
       ipLimitEnable: false,
       pageSize: 0,
+      tablePages: {},
     },
     methods: {
       loading(spinning = true) {
@@ -2027,7 +2030,10 @@
           this.loadingStates.spinning = false;
         }
       },
-      pagination(obj) {
+      // The table merges this prop over its own pager state on every re-render (page change, live
+      // traffic refresh), so a fixed pageSize here snapped the size the user picked back to the default.
+      // The page and size each table last reported are kept per tableKey and handed back instead.
+      pagination(obj, tableKey) {
         if (this.pageSize > 0 && obj.length > this.pageSize) {
           // Set page options based on object size
           let sizeOptions = [this.pageSize.toString()];
@@ -2043,16 +2049,22 @@
             sizeOptions.push(obj.length.toString());
           }
 
-          p = {
+          const remembered = this.tablePages[tableKey] || {};
+          const pageSize = remembered.pageSize || this.pageSize;
+          const lastPage = Math.max(1, Math.ceil(obj.length / pageSize));
+          return {
             showSizeChanger: true,
             size: 'small',
             position: 'bottom',
-            pageSize: this.pageSize,
+            current: Math.min(remembered.current || 1, lastPage),
+            pageSize: pageSize,
             pageSizeOptions: sizeOptions
           };
-          return p;
         }
         return false
+      },
+      rememberPage(tableKey, page) {
+        this.$set(this.tablePages, tableKey, { current: page.current, pageSize: page.pageSize });
       }
     },
     watch: {
