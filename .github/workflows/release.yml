@@ -20,6 +20,10 @@ on:
       - "x-ui.service.rhel"
   pull_request:
 
+env:
+  # The Xray core bundled into every release archive; one place for both the Linux and Windows jobs
+  XRAY_URL: https://github.com/ariansharifi/Xray-core/releases/download/v26.10.25/
+
 jobs:
   analyze:
     name: Analyze Go code
@@ -126,7 +130,7 @@ jobs:
           cd x-ui/bin
 
           # Download dependencies
-          Xray_URL="https://github.com/ariansharifi/Xray-core/releases/download/v26.10.24/"
+          Xray_URL="${XRAY_URL}"
           if [ "${{ matrix.platform }}" == "amd64" ]; then
             wget -q ${Xray_URL}Xray-linux-64.zip
             unzip Xray-linux-64.zip
@@ -184,7 +188,8 @@ jobs:
           file: x-ui-linux-${{ matrix.platform }}.tar.gz
           asset_name: x-ui-linux-${{ matrix.platform }}.tar.gz
           overwrite: true
-          prerelease: true
+          # a full release, so install.sh's releases/latest lookup finds it
+          prerelease: false
 
   # =================================
   #  Windows Build
@@ -244,7 +249,7 @@ jobs:
           cd x-ui\bin
 
           # Download Xray for Windows
-          $Xray_URL = "https://github.com/ariansharifi/Xray-core/releases/download/v26.10.24/"
+          $Xray_URL = $env:XRAY_URL
           Invoke-WebRequest -Uri "${Xray_URL}Xray-windows-64.zip" -OutFile "Xray-windows-64.zip"
           Expand-Archive -Path "Xray-windows-64.zip" -DestinationPath .
           Remove-Item "Xray-windows-64.zip"
@@ -280,4 +285,5 @@ jobs:
           file: x-ui-windows-amd64.zip
           asset_name: x-ui-windows-amd64.zip
           overwrite: true
-          prerelease: true
+          # a full release, so install.sh's releases/latest lookup finds it
+          prerelease: false
