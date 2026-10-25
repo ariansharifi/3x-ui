@@ -943,25 +943,12 @@ func (s *ServerService) GetConfigJson() (any, error) {
 }
 
 func (s *ServerService) GetDb() ([]byte, error) {
-	// Update by manually trigger a checkpoint operation
-	err := database.Checkpoint()
+	snapshot, cleanup, err := database.Snapshot()
 	if err != nil {
 		return nil, err
 	}
-	// Open the file for reading
-	file, err := os.Open(config.GetDBPath())
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	// Read the file contents
-	fileContents, err := io.ReadAll(file)
-	if err != nil {
-		return nil, err
-	}
-
-	return fileContents, nil
+	defer cleanup()
+	return os.ReadFile(snapshot)
 }
 
 func (s *ServerService) ImportDB(file multipart.File) error {
@@ -984,10 +971,8 @@ func (s *ServerService) ImportDB(file multipart.File) error {
 	tempPath := fmt.Sprintf("%s.temp", config.GetDBPath())
 
 	// Remove the existing temporary file (if any)
-	if _, err := os.Stat(tempPath); err == nil {
-		if errRemove := os.Remove(tempPath); errRemove != nil {
-			return common.NewErrorf("Error removing existing temporary db file: %v", errRemove)
-		}
+	if errRemove := database.RemoveDBFiles(tempPath); errRemove != nil {
+		return common.NewErrorf("Error removing existing temporary db file: %v", errRemove)
 	}
 
 	// Create the temporary file
@@ -1003,10 +988,8 @@ func (s *ServerService) ImportDB(file multipart.File) error {
 				logger.Warningf("Warning: failed to close temp file: %v", cerr)
 			}
 		}
-		if _, err := os.Stat(tempPath); err == nil {
-			if rerr := os.Remove(tempPath); rerr != nil {
-				logger.Warningf("Warning: failed to remove temp file: %v", rerr)
-			}
+		if rerr := database.RemoveDBFiles(tempPath); rerr != nil {
+			logger.Warningf("Warning: failed to remove temp file: %v", rerr)
 		}
 	}()
 
@@ -1040,30 +1023,26 @@ func (s *ServerService) ImportDB(file multipart.File) error {
 	fallbackPath := fmt.Sprintf("%s.backup", config.GetDBPath())
 
 	// Remove the existing fallback file (if any)
-	if _, err := os.Stat(fallbackPath); err == nil {
-		if errRemove := os.Remove(fallbackPath); errRemove != nil {
-			return common.NewErrorf("Error removing existing fallback db file: %v", errRemove)
-		}
+	if errRemove := database.RemoveDBFiles(fallbackPath); errRemove != nil {
+		return common.NewErrorf("Error removing existing fallback db file: %v", errRemove)
 	}
 
-	// Move the current database to the fallback location
-	if err = os.Rename(config.GetDBPath(), fallbackPath); err != nil {
+	// Move the current database, with its WAL sidecars, to the fallback location
+	if err = database.MoveDBFiles(config.GetDBPath(), fallbackPath); err != nil {
 		return common.NewErrorf("Error backing up current db file: %v", err)
 	}
 
 	// Defer fallback cleanup ONLY if everything goes well
 	defer func() {
-		if _, err := os.Stat(fallbackPath); err == nil {
-			if rerr := os.Remove(fallbackPath); rerr != nil {
-				logger.Warningf("Warning: failed to remove fallback file: %v", rerr)
-			}
+		if rerr := database.RemoveDBFiles(fallbackPath); rerr != nil {
+			logger.Warningf("Warning: failed to remove fallback file: %v", rerr)
 		}
 	}()
 
 	// Move temp to DB path
-	if err = os.Rename(tempPath, config.GetDBPath()); err != nil {
+	if err = database.MoveDBFiles(tempPath, config.GetDBPath()); err != nil {
 		// Restore from fallback
-		if errRename := os.Rename(fallbackPath, config.GetDBPath()); errRename != nil {
+		if errRename := database.MoveDBFiles(fallbackPath, config.GetDBPath()); errRename != nil {
 			return common.NewErrorf("Error moving db file and restoring fallback: %v", errRename)
 		}
 		return common.NewErrorf("Error moving db file: %v", err)
@@ -1071,7 +1050,12 @@ func (s *ServerService) ImportDB(file multipart.File) error {
 
 	// Open & migrate new DB
 	if err = database.InitDB(config.GetDBPath()); err != nil {
-		if errRename := os.Rename(fallbackPath, config.GetDBPath()); errRename != nil {
+		// Drop the rejected file's WAL too, so it is not replayed onto the restored database
+		database.CloseDB()
+		if errRemove := database.RemoveDBFiles(config.GetDBPath()); errRemove != nil {
+			return common.NewErrorf("Error migrating db and removing it: %v", errRemove)
+		}
+		if errRename := database.MoveDBFiles(fallbackPath, config.GetDBPath()); errRename != nil {
 			return common.NewErrorf("Error migrating db and restoring fallback: %v", errRename)
 		}
 		return common.NewErrorf("Error migrating db: %v", err)

@@ -3639,14 +3639,13 @@ func (t *Tgbot) sendBackup(chatId int64) {
 	output := t.I18nBot("tgbot.messages.backupTime", "Time=="+time.Now().Format("2006-01-02 15:04:05"))
 	t.SendMsgToTgbot(chatId, output)
 
-	// Update by manually trigger a checkpoint operation
-	err := database.Checkpoint()
-	if err != nil {
-		logger.Error("Error in trigger a checkpoint operation: ", err)
-	}
-
 	// Send database backup
-	file, err := os.Open(config.GetDBPath())
+	snapshot, cleanup, err := database.Snapshot()
+	var file *os.File
+	if err == nil {
+		defer cleanup()
+		file, err = os.Open(snapshot)
+	}
 	if err == nil {
 		defer file.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

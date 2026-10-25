@@ -859,16 +859,16 @@ install_x-ui() {
     mkdir -p /var/log/x-ui
     config_after_install
 
-    # Etckeeper compatibility
+    # Etckeeper compatibility; the wildcard also covers the database's WAL sidecars
     if [ -d "/etc/.git" ]; then
         if [ -f "/etc/.gitignore" ]; then
-            if ! grep -q "x-ui/x-ui.db" "/etc/.gitignore"; then
+            if ! grep -qF "x-ui/x-ui.db*" "/etc/.gitignore"; then
                 echo "" >> "/etc/.gitignore"
-                echo "x-ui/x-ui.db" >> "/etc/.gitignore"
+                echo "x-ui/x-ui.db*" >> "/etc/.gitignore"
                 echo -e "${green}Added x-ui.db to /etc/.gitignore for etckeeper${plain}"
             fi
         else
-            echo "x-ui/x-ui.db" > "/etc/.gitignore"
+            echo "x-ui/x-ui.db*" > "/etc/.gitignore"
             echo -e "${green}Created /etc/.gitignore and added x-ui.db for etckeeper${plain}"
         fi
     fi

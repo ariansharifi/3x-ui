@@ -139,7 +139,7 @@ func InitDB(dbPath string) error {
 	c := &gorm.Config{
 		Logger: gormLogger,
 	}
-	db, err = gorm.Open(sqlite.Open(dbPath), c)
+	db, err = gorm.Open(sqlite.Open(sqliteDSN(dbPath)), c)
 	if err != nil {
 		return err
 	}
@@ -157,6 +157,14 @@ func InitDB(dbPath string) error {
 		return err
 	}
 	return runSeeders(isUsersEmpty)
+}
+
+// sqliteDSN opens every pooled connection in WAL mode, so readers never block the writer, and makes
+// every transaction BEGIN IMMEDIATE, so a writer queues for the lock up front instead of failing with
+// "database is locked" when a read-then-write transaction tries to upgrade. An inbound with tens of
+// thousands of clients is one multi-megabyte settings row, rewritten on each client change.
+func sqliteDSN(dbPath string) string {
+	return dbPath + "?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=10000&_txlock=immediate&_cache_size=-32768"
 }
 
 // CloseDB closes the database connection if it exists.
@@ -197,6 +205,50 @@ func Checkpoint() error {
 	err := db.Exec("PRAGMA wal_checkpoint;").Error
 	if err != nil {
 		return err
+	}
+	return nil
+}
+
+// Snapshot writes a consistent copy of the live database, under the database's own file name, into a
+// fresh temporary directory; cleanup removes it. In WAL mode the main file alone can lack recent commits
+// or be caught mid-checkpoint, so it must not be read directly as a backup.
+func Snapshot() (snapshotPath string, cleanup func(), err error) {
+	dir, err := os.MkdirTemp("", "x-ui-db-")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup = func() { os.RemoveAll(dir) }
+	snapshotPath = path.Join(dir, path.Base(config.GetDBPath()))
+	if err = db.Exec("VACUUM INTO ?", snapshotPath).Error; err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return snapshotPath, cleanup, nil
+}
+
+// sqliteSidecars are the files SQLite keeps next to a WAL-mode database. They belong to that one file:
+// left behind when it is replaced, a stale WAL would be replayed onto the new database.
+var sqliteSidecars = []string{"-wal", "-shm"}
+
+// MoveDBFiles renames a database file together with its WAL sidecars.
+func MoveDBFiles(from, to string) error {
+	if err := os.Rename(from, to); err != nil {
+		return err
+	}
+	for _, suffix := range sqliteSidecars {
+		if err := os.Rename(from+suffix, to+suffix); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+// RemoveDBFiles deletes a database file and its WAL sidecars; missing files are not an error.
+func RemoveDBFiles(dbPath string) error {
+	for _, suffix := range append([]string{""}, sqliteSidecars...) {
+		if err := os.Remove(dbPath + suffix); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
 	}
 	return nil
 }
